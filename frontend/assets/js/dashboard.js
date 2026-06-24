@@ -1,17 +1,20 @@
-import { appUrl, downloadFromApi, getJson, postJson, setReportAccessToken } from "./api.js?v=5.4.2";
-import { initTheme } from "./theme.js?v=5.4.2";
-import { BrowserEyeMonitor } from "./browser-eye-monitor.js?v=5.4.2";
+import { appUrl, downloadFromApi, getJson, postJson, setReportAccessToken } from "./api.js?v=5.4.3";
+import { initTheme } from "./theme.js?v=5.4.3";
+import { BrowserEyeMonitor } from "./browser-eye-monitor.js?v=5.4.3";
 
 const $ = (id) => document.getElementById(id);
 const METRIC_SYNC_INTERVAL_MS = 1000;
 const BACKGROUND_SYNC_INTERVAL_MS = 5000;
-const BACKGROUND_TICK_INTERVAL_MS = 1000;
-const FRAME_STALE_THRESHOLD_MS = 1800;
+const BACKGROUND_DETECTION_INTERVAL_MS = 1000;
+const SESSION_CLOCK_INTERVAL_MS = 1000;
+const STALE_FRAME_CLOCK_MS = 1250;
 const DESKTOP_NOTIFICATION_COOLDOWN_MS = 5 * 60 * 1000;
 
 let stream = null;
 let captureRunning = false;
 let animationFrameId = null;
+let detectionIntervalId = null;
+let sessionClockIntervalId = null;
 let browserMonitor = null;
 let metricSyncInFlight = false;
 let metricSyncPromise = Promise.resolve();
@@ -26,12 +29,11 @@ let lastMetricLogAt = 0;
 let consecutiveFrameErrors = 0;
 let audioContext = null;
 let lastAudioAlertAt = 0;
-let backgroundTimerWorker = null;
-let fallbackTimerId = null;
 let lastVisualFrameProcessedAt = 0;
 let lastBackgroundMetricSyncAt = 0;
 let notificationPermissionAsked = false;
 let lastDesktopNotificationAt = 0;
+let pageCloseSignalSent = false;
 
 const AUDIO_ENABLED_KEY = "netraware-audio-enabled";
 const AUDIO_VOLUME_KEY = "netraware-audio-volume";
@@ -196,7 +198,6 @@ function initializeAudioSettings() {
   });
 }
 
-
 function requestDesktopNotificationPermission() {
   if (!("Notification" in window) || notificationPermissionAsked) return;
   notificationPermissionAsked = true;
@@ -207,7 +208,7 @@ function requestDesktopNotificationPermission() {
 
 function showDesktopNotification(data) {
   if (!("Notification" in window)) return;
-  if (!document.hidden || Notification.permission !== "granted") return;
+  if (Notification.permission !== "granted") return;
   const now = Date.now();
   if (now - lastDesktopNotificationAt < DESKTOP_NOTIFICATION_COOLDOWN_MS) return;
   lastDesktopNotificationAt = now;
@@ -219,52 +220,6 @@ function showDesktopNotification(data) {
     });
   } catch {
     // Notifikasi desktop bersifat opsional; banner dashboard tetap aktif.
-  }
-}
-
-function startBackgroundTimer() {
-  stopBackgroundTimer();
-  try {
-    backgroundTimerWorker = new Worker("/assets/js/background-timer-worker.js?v=5.4.2");
-    backgroundTimerWorker.onmessage = () => handleBackgroundTick();
-    backgroundTimerWorker.postMessage({ type: "start", intervalMs: BACKGROUND_TICK_INTERVAL_MS });
-    return;
-  } catch {
-    backgroundTimerWorker = null;
-  }
-  fallbackTimerId = window.setInterval(handleBackgroundTick, BACKGROUND_TICK_INTERVAL_MS);
-}
-
-function stopBackgroundTimer() {
-  if (backgroundTimerWorker) {
-    backgroundTimerWorker.postMessage({ type: "stop" });
-    backgroundTimerWorker.terminate();
-    backgroundTimerWorker = null;
-  }
-  if (fallbackTimerId !== null) {
-    clearInterval(fallbackTimerId);
-    fallbackTimerId = null;
-  }
-}
-
-function handleBackgroundTick({ forceSync = false } = {}) {
-  if (!captureRunning || sessionEnded || !browserMonitor?.isCalibrated) return;
-  const nowMs = performance.now();
-  const frameIsStale = !lastVisualFrameProcessedAt
-    || nowMs - lastVisualFrameProcessedAt >= FRAME_STALE_THRESHOLD_MS;
-  if (!document.hidden && !frameIsStale && !forceSync) return;
-
-  const data = browserMonitor.createTimeOnlySnapshot(nowMs, { hidden: document.hidden });
-  if (!data) return;
-  lastLocalMetric = data;
-  updateDashboard(data);
-
-  const dueForSync = forceSync
-    || data.should_alert
-    || nowMs - lastBackgroundMetricSyncAt >= BACKGROUND_SYNC_INTERVAL_MS;
-  if (dueForSync) {
-    lastBackgroundMetricSyncAt = nowMs;
-    void syncMetricToBackend(data, nowMs, true).catch(() => {});
   }
 }
 
@@ -299,7 +254,7 @@ function statusLabel(status) {
 }
 
 function eyeStateLabel(data) {
-  if (data.background_mode || data.eye_state === "BACKGROUND") return "Timer background";
+  if (data.background_mode || data.eye_state === "BACKGROUND") return "Timer berjalan";
   if (data.eye_state === "MENUNGGU_FRAME") return "Menunggu frame";
   if (data.blink_event) return "Kedip terdeteksi";
   if (data.eye_state === "TERTUTUP" || data.is_eye_closed) return "Tertutup";
@@ -360,7 +315,9 @@ function updateDashboard(data) {
   }
 
   if (data.phase === "MONITORING") {
-    text("phaseLabel", data.background_mode ? "Monitoring waktu aktif di background." : (data.success ? "Monitoring aktif." : "Monitoring aktif, tetapi wajah belum terbaca."));
+    text("phaseLabel", data.background_mode
+      ? "Monitoring sesi tetap aktif; menunggu frame kamera baru."
+      : (data.success ? "Monitoring aktif." : "Monitoring aktif, tetapi wajah belum terbaca."));
     text("statusLabel", statusLabel(data.status));
     text("statusMessage", data.message || "-");
     updateMetrics(data);
@@ -369,7 +326,7 @@ function updateDashboard(data) {
       connection("Monitoring aktif • penyimpanan bermasalah", "warning");
       message(data.storage_warning || "Monitoring berjalan, tetapi data metrik belum dapat disimpan.", "error");
     } else if (data.background_mode) {
-      connection("Timer background aktif", "warning");
+      connection("Timer sesi aktif", "warning");
     } else {
       connection(data.success ? "Monitoring aktif" : "Wajah tidak terbaca", data.success ? "success" : "neutral");
     }
@@ -492,16 +449,14 @@ async function startCamera() {
     localFpsWindowStartedAt = performance.now();
     lastVisualFrameProcessedAt = 0;
     lastBackgroundMetricSyncAt = 0;
-    startBackgroundTimer();
     disable("stopCameraButton", false);
     disable("endSessionButton", false);
     connection("Deteksi lokal aktif", "success");
-    message("Kamera aktif. Video diproses langsung di browser dan tidak dikirim ke Railway.", "success");
-    animationFrameId = requestAnimationFrame(runLocalDetectionLoop);
+    message("Kamera aktif. Timer sesi hanya berhenti jika sesi diakhiri atau tab ditutup.", "success");
+    startMonitoringSchedulers();
   } catch (error) {
     captureRunning = false;
-    if (animationFrameId !== null) cancelAnimationFrame(animationFrameId);
-    animationFrameId = null;
+    stopMonitoringSchedulers();
     stream?.getTracks().forEach((track) => track.stop());
     stream = null;
     video.srcObject = null;
@@ -571,8 +526,8 @@ function syncMetricToBackend(data, nowMs, force = false) {
   return metricSyncPromise;
 }
 
-function runLocalDetectionLoop(nowMs = performance.now()) {
-  if (!captureRunning || sessionEnded || !browserMonitor) return;
+function processDetectionFrame(nowMs = performance.now()) {
+  if (!captureRunning || sessionEnded || !browserMonitor) return null;
 
   try {
     const data = browserMonitor.processVideoFrame(video, nowMs);
@@ -590,12 +545,73 @@ function runLocalDetectionLoop(nowMs = performance.now()) {
         localFpsWindowStartedAt = nowMs;
       }
     }
+    return data;
   } catch (error) {
     connection("Deteksi lokal gagal", "danger");
     message(`MediaPipe browser gagal memproses frame: ${error.message}`, "error");
+    return null;
   }
+}
 
+function updateSessionClockSnapshot({ forceSync = false } = {}) {
+  if (!captureRunning || sessionEnded || !browserMonitor?.isCalibrated) return null;
+  const nowMs = performance.now();
+  const frameIsStale = !lastVisualFrameProcessedAt
+    || nowMs - lastVisualFrameProcessedAt >= STALE_FRAME_CLOCK_MS;
+  if (!frameIsStale && !forceSync) return lastLocalMetric;
+
+  const data = browserMonitor.createClockSnapshot(nowMs, { hidden: document.hidden });
+  if (!data) return null;
+  lastLocalMetric = data;
+  updateDashboard(data);
+
+  const dueForSync = forceSync
+    || data.should_alert
+    || nowMs - lastBackgroundMetricSyncAt >= BACKGROUND_SYNC_INTERVAL_MS;
+  if (dueForSync) {
+    lastBackgroundMetricSyncAt = nowMs;
+    void syncMetricToBackend(data, nowMs, true).catch(() => {});
+  }
+  return data;
+}
+
+function backgroundDetectionTick() {
+  if (!captureRunning || sessionEnded || !browserMonitor) return;
+  const nowMs = performance.now();
+  const shouldAttempt = document.hidden
+    || !document.hasFocus()
+    || !lastVisualFrameProcessedAt
+    || nowMs - lastVisualFrameProcessedAt >= STALE_FRAME_CLOCK_MS;
+  if (shouldAttempt) processDetectionFrame(nowMs);
+  updateSessionClockSnapshot();
+}
+
+function runLocalDetectionLoop(nowMs = performance.now()) {
+  if (!captureRunning || sessionEnded || !browserMonitor) return;
+  processDetectionFrame(nowMs);
   animationFrameId = requestAnimationFrame(runLocalDetectionLoop);
+}
+
+function startMonitoringSchedulers() {
+  stopMonitoringSchedulers();
+  animationFrameId = requestAnimationFrame(runLocalDetectionLoop);
+  detectionIntervalId = window.setInterval(backgroundDetectionTick, BACKGROUND_DETECTION_INTERVAL_MS);
+  sessionClockIntervalId = window.setInterval(() => updateSessionClockSnapshot(), SESSION_CLOCK_INTERVAL_MS);
+}
+
+function stopMonitoringSchedulers() {
+  if (animationFrameId !== null) {
+    cancelAnimationFrame(animationFrameId);
+    animationFrameId = null;
+  }
+  if (detectionIntervalId !== null) {
+    clearInterval(detectionIntervalId);
+    detectionIntervalId = null;
+  }
+  if (sessionClockIntervalId !== null) {
+    clearInterval(sessionClockIntervalId);
+    sessionClockIntervalId = null;
+  }
 }
 
 function notifyBackendPause(silent = false) {
@@ -608,12 +624,10 @@ function notifyBackendPause(silent = false) {
 function stopCamera({ silent = false, notifyBackend = true } = {}) {
   const wasRunning = captureRunning;
   captureRunning = false;
-  if (animationFrameId !== null) cancelAnimationFrame(animationFrameId);
-  animationFrameId = null;
-  stopBackgroundTimer();
+  stopMonitoringSchedulers();
   browserMonitor?.pause();
   if (lastLocalMetric?.is_calibrated) {
-    void syncMetricToBackend(lastLocalMetric, performance.now(), true).catch(() => {});
+    syncMetricToBackend(lastLocalMetric, performance.now(), true);
   }
   stream?.getTracks().forEach((track) => track.stop());
   stream = null;
@@ -646,9 +660,13 @@ async function markRest() {
 async function endSession() {
   if (!confirm("Akhiri sesi monitoring ini?")) return;
   try {
-    if (lastLocalMetric?.is_calibrated) {
+    const finalMetric = browserMonitor?.isCalibrated
+      ? browserMonitor.createClockSnapshot(performance.now(), { hidden: document.hidden, reason: "manual_end" })
+      : lastLocalMetric;
+    if (finalMetric?.is_calibrated) {
       try {
-        await syncMetricToBackend(lastLocalMetric, performance.now(), true);
+        lastLocalMetric = finalMetric;
+        await syncMetricToBackend(finalMetric, performance.now(), true);
       } catch {
         // Ringkasan tetap dapat dibuat dari snapshot terakhir yang berhasil tersimpan.
       }
@@ -751,6 +769,36 @@ async function loadSession() {
   }
 }
 
+function sendCloseSessionBeacon() {
+  const code = sessionCode();
+  if (!code || sessionEnded || pageCloseSignalSent) return;
+  pageCloseSignalSent = true;
+  let finalMetric = lastLocalMetric;
+  try {
+    if (browserMonitor?.isCalibrated) {
+      finalMetric = browserMonitor.createClockSnapshot(performance.now(), {
+        hidden: true,
+        reason: "page_close",
+      }) || lastLocalMetric;
+    }
+  } catch {
+    finalMetric = lastLocalMetric;
+  }
+
+  if (finalMetric?.is_calibrated) {
+    try {
+      const body = new Blob([JSON.stringify(buildMetricPayload(finalMetric))], {
+        type: "application/json",
+      });
+      navigator.sendBeacon(appUrl(`/api/monitoring/session/close/${encodeURIComponent(code)}`), body);
+      return;
+    } catch {
+      // Fallback di bawah tetap mencoba menutup sesi tanpa snapshot akhir.
+    }
+  }
+  navigator.sendBeacon(appUrl(`/api/monitoring/session/close/${encodeURIComponent(code)}`));
+}
+
 function bindNavigation() {
   document.querySelectorAll("[data-nav-target]").forEach((link) => {
     link.addEventListener("click", () => {
@@ -772,20 +820,22 @@ $("startAgainButton").addEventListener("click", startAgain);
 $("downloadPdfButton").addEventListener("click", downloadPdf);
 document.addEventListener("visibilitychange", () => {
   if (!captureRunning || sessionEnded) return;
-  if (document.hidden) {
-    handleBackgroundTick({ forceSync: true });
-  } else {
-    handleBackgroundTick({ forceSync: true });
-    if (browserMonitor?.isCalibrated) {
-      message("Tab aktif kembali. Deteksi mata real-time dilanjutkan; timer tidak diulang dari nol.", "success");
-    }
+  processDetectionFrame(performance.now());
+  updateSessionClockSnapshot({ forceSync: true });
+  if (!document.hidden && browserMonitor?.isCalibrated) {
+    message("Tab aktif kembali. Timer sesi tetap berjalan; deteksi EAR dilanjutkan dari frame kamera terbaru.", "success");
   }
 });
-window.addEventListener("beforeunload", () => {
-  const code = sessionCode();
-  if (captureRunning && code && !sessionEnded) {
-    navigator.sendBeacon(appUrl(`/api/monitoring/pause/${encodeURIComponent(code)}`));
-  }
-  stopCamera({ silent: true, notifyBackend: false });
+window.addEventListener("blur", () => {
+  if (!captureRunning || sessionEnded) return;
+  processDetectionFrame(performance.now());
+  updateSessionClockSnapshot({ forceSync: true });
 });
+window.addEventListener("focus", () => {
+  if (!captureRunning || sessionEnded) return;
+  processDetectionFrame(performance.now());
+  updateSessionClockSnapshot({ forceSync: true });
+});
+window.addEventListener("pagehide", sendCloseSessionBeacon);
+window.addEventListener("beforeunload", sendCloseSessionBeacon);
 loadSession();

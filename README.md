@@ -59,7 +59,7 @@ OPEN_BROWSER=1
 Setelah virtual environment aktif, jalankan:
 
 ```powershell
-python app.py / py app.py
+python app.py
 ```
 
 Browser akan membuka:
@@ -69,6 +69,24 @@ http://127.0.0.1:8000
 ```
 
 Untuk menonaktifkan pembukaan browser otomatis, ubah `OPEN_BROWSER=0`.
+
+## Deployment ke Railway tanpa GitHub
+
+Perubahan production tetap harus dideploy, tetapi tidak perlu dipush ke GitHub. Railway CLI dapat mengunggah folder lokal langsung ke service Railway yang sudah ada.
+
+```powershell
+npm install -g @railway/cli
+railway login
+cd C:\lokasi\NetraWare_Browser_MediaPipe
+railway link
+railway status
+railway up
+```
+
+Saat `railway link`, pilih project, environment, dan service aplikasi FastAPI yang benar—bukan service PostgreSQL. Variabel Railway serta koneksi database yang sudah ada tetap digunakan. Setelah deployment, lakukan hard refresh `Ctrl + Shift + R` pada browser.
+
+Panduan pemeriksaan lokal, arsitektur, dan deployment terperinci tersedia pada `PANDUAN_BROWSER_MEDIAPIPE.md`.
+
 
 ## Endpoint penting
 

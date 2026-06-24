@@ -9,7 +9,7 @@ from typing import Dict, Optional
 
 import cv2
 import numpy as np
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -214,6 +214,55 @@ def close_active_session(session_code: str) -> None:
             if active_session.detector is not None:
                 active_session.detector.close()
                 active_session.detector = None
+
+
+def store_forced_client_metric(db: Session, db_session: MonitoringSession, payload: ClientMetricRequest) -> None:
+    """Simpan snapshot metrik akhir dari browser tanpa throttling interval.
+
+    Dipakai oleh endpoint penutupan tab agar durasi sesi terakhir tetap tercatat
+    meskipun halaman sedang di-background dan tidak sempat melakukan sync reguler.
+    """
+
+    if not payload.is_calibrated:
+        return
+
+    if payload.baseline_ear and not db_session.baseline_ear:
+        db_session.baseline_ear = payload.baseline_ear
+    if payload.ear_threshold and not db_session.ear_threshold:
+        db_session.ear_threshold = payload.ear_threshold
+
+    db.add(
+        MetricRecord(
+            session_id=db_session.id,
+            elapsed_seconds=payload.screen_duration_seconds,
+            ear_left=payload.ear_left,
+            ear_right=payload.ear_right,
+            ear_avg=payload.ear_avg,
+            ear=payload.ear_avg,
+            ear_threshold=payload.ear_threshold,
+            is_eye_closed=payload.is_eye_closed,
+            blink_count_total=payload.blink_count_total,
+            blink_rate_per_minute=payload.blink_rate_per_minute,
+            blink_rate_ready=payload.blink_rate_ready,
+            perclos=payload.perclos,
+            perclos_ready=payload.perclos_ready,
+            screen_duration_seconds=payload.screen_duration_seconds,
+            duration_since_last_rest_seconds=payload.duration_since_last_rest_seconds,
+            current_eye_closed_seconds=payload.current_eye_closed_seconds,
+            fatigue_score=payload.fatigue_score,
+            status=payload.status,
+            message=payload.message,
+        )
+    )
+    if payload.should_alert:
+        db.add(
+            AlertRecord(
+                session_id=db_session.id,
+                alert_type="REST_REMINDER",
+                message=payload.message,
+                fatigue_score_at_alert=payload.fatigue_score,
+            )
+        )
 
 
 @router.post("/users")
@@ -684,6 +733,49 @@ def get_active_session_status(session_code: str, db: Session = Depends(get_db)):
         "is_active": active_session is not None,
         "is_calibrated": active_session.is_calibrated if active_session else False,
     }
+
+
+@router.post("/session/close/{session_code}")
+def close_monitoring_session_from_browser(
+    session_code: str,
+    payload: Optional[ClientMetricRequest] = Body(default=None),
+    db: Session = Depends(get_db),
+):
+    """Akhiri sesi saat tab browser ditutup.
+
+    Endpoint ini menerima snapshot metrik terakhir melalui ``navigator.sendBeacon``.
+    Dengan demikian durasi akhir tetap mengikuti jam sesi, bukan hanya snapshot
+    terakhir sebelum tab masuk background.
+    """
+
+    db_session = (
+        db.query(MonitoringSession)
+        .filter(MonitoringSession.session_code == session_code)
+        .first()
+    )
+    if not db_session:
+        close_active_session(session_code)
+        raise HTTPException(status_code=404, detail="Sesi tidak ditemukan.")
+
+    try:
+        if db_session.ended_at is None:
+            db_session.ended_at = utc_now()
+        if payload is not None:
+            store_forced_client_metric(db, db_session, payload)
+        db_session = summarize_and_update_session(db, db_session)
+        return {
+            "message": "Sesi monitoring ditutup dari browser.",
+            "session": db_session.to_dict(),
+        }
+    except SQLAlchemyError as exc:
+        db.rollback()
+        LOGGER.exception("Gagal menutup sesi %s dari browser.", session_code)
+        raise HTTPException(
+            status_code=503,
+            detail="Sesi belum dapat ditutup karena transaksi database gagal.",
+        ) from exc
+    finally:
+        close_active_session(session_code)
 
 
 @router.post("/session/end/{session_code}")

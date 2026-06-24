@@ -138,25 +138,7 @@ class LocalFatigueEngine {
     this.closedStartedAt = null;
     this.closedFrameCount = 0;
     this.currentEyeClosedSeconds = 0;
-  }
-
-  timeOnlyUpdate(nowSeconds) {
-    this.ensureStarted(nowSeconds);
-    this.resetClosure();
-    const lastSample = this.eyeStateWindow.length
-      ? this.eyeStateWindow[this.eyeStateWindow.length - 1][0]
-      : null;
-    if (lastSample === null || nowSeconds - lastSample >= 0.5) {
-      this.eyeStateWindow.push([nowSeconds, 0]);
-    }
-    this.prune(nowSeconds);
-    const ear = this.baselineEar || 0;
-    return this.buildResult({
-      ear,
-      isEyeClosed: false,
-      blinkEvent: false,
-      nowSeconds,
-    });
+    this.lastBuiltResult = null;
   }
 
   setBaseline(baselineEar) {
@@ -273,6 +255,66 @@ class LocalFatigueEngine {
       fatigue_score: 0,
       should_alert: false,
     };
+  }
+
+  clockOnlyUpdate(nowSeconds) {
+    this.ensureStarted(nowSeconds);
+    this.resetClosure();
+    this.prune(nowSeconds);
+
+    const screenDuration = this.screenDuration(nowSeconds);
+    const durationSinceRest = this.durationSinceRest(nowSeconds);
+    const evidenceDuration = this.evidenceDuration(nowSeconds);
+    const previous = this.lastBuiltResult || {};
+    const blinkRateReady = evidenceDuration >= this.config.blinkRateWarmupSeconds;
+    const blinkRate = blinkRateReady ? this.calculateBlinkRate(nowSeconds) : 0;
+    const perclosReady = Boolean(previous.perclos_ready) || (
+      evidenceDuration >= this.config.perclosWarmupSeconds && this.eyeStateWindow.length >= 2
+    );
+    const perclos = perclosReady ? Number(previous.perclos || 0) : 0;
+    const fatigueScore = this.calculateScore({
+      blinkRate,
+      blinkRateReady,
+      perclos,
+      perclosReady,
+      durationSinceRest,
+    });
+    const [status, message] = this.determineStatus({
+      fatigueScore,
+      screenDuration,
+      durationSinceRest,
+      perclosReady,
+    });
+
+    let shouldAlert = false;
+    if (status === "PERLU_ISTIRAHAT"
+      && screenDuration >= this.config.alertGracePeriodSeconds
+      && (this.lastAlertAt === null
+        || nowSeconds - this.lastAlertAt >= this.config.alertCooldownSeconds)) {
+      this.lastAlertAt = nowSeconds;
+      shouldAlert = true;
+    }
+
+    const result = {
+      ear_threshold: this.earThreshold ?? 0,
+      is_eye_closed: false,
+      eye_state: "MENUNGGU_FRAME",
+      blink_event: false,
+      blink_count_total: this.totalBlinkCount,
+      blink_rate_per_minute: blinkRate,
+      blink_rate_ready: blinkRateReady,
+      perclos,
+      perclos_ready: perclosReady,
+      screen_duration_seconds: screenDuration,
+      duration_since_last_rest_seconds: durationSinceRest,
+      current_eye_closed_seconds: 0,
+      fatigue_score: fatigueScore,
+      status,
+      message,
+      should_alert: shouldAlert,
+    };
+    this.lastBuiltResult = result;
+    return result;
   }
 
   registerBlink(nowSeconds, closureDuration) {
@@ -413,7 +455,7 @@ class LocalFatigueEngine {
       shouldAlert = true;
     }
 
-    return {
+    const result = {
       ear_threshold: this.earThreshold ?? 0,
       is_eye_closed: isEyeClosed,
       eye_state: isEyeClosed ? "TERTUTUP" : "TERBUKA",
@@ -431,6 +473,8 @@ class LocalFatigueEngine {
       message,
       should_alert: shouldAlert,
     };
+    this.lastBuiltResult = result;
+    return result;
   }
 }
 
@@ -497,32 +541,39 @@ export class BrowserEyeMonitor {
     if (this.isCalibrated) this.engine.markRest(nowMs / 1000);
   }
 
-  createTimeOnlySnapshot(nowMs = performance.now(), { hidden = document.hidden } = {}) {
+  createClockSnapshot(nowMs = performance.now(), { hidden = document.hidden, reason = "clock" } = {}) {
     if (!this.isCalibrated) return null;
     const nowSeconds = nowMs / 1000;
-    const fatigue = this.engine.timeOnlyUpdate(nowSeconds);
+    const fatigue = this.engine.clockOnlyUpdate(nowSeconds);
     const last = this.lastResult || {};
     const detectionPayload = this.lastDetectionPayload || {
       image_width: last.image_width || 0,
       image_height: last.image_height || 0,
-      left_eye_points: [],
-      right_eye_points: [],
+      left_eye_points: Array.isArray(last.left_eye_points) ? last.left_eye_points : [],
+      right_eye_points: Array.isArray(last.right_eye_points) ? last.right_eye_points : [],
+      ear_left: Number(last.ear_left) || this.engine.baselineEar || 0,
+      ear_right: Number(last.ear_right) || this.engine.baselineEar || 0,
+      ear_avg: Number(last.ear_avg) || this.engine.baselineEar || 0,
     };
+    const frameStaleSeconds = this.lastProcessedFrameAtMs >= 0
+      ? Math.max(0, (nowMs - this.lastProcessedFrameAtMs) / 1000)
+      : 0;
     const message = fatigue.status === "PERLU_ISTIRAHAT"
       ? fatigue.message
       : (hidden
-        ? "Timer layar tetap berjalan di background. Deteksi mata dilanjutkan otomatis saat tab aktif kembali."
-        : "Timer layar tetap berjalan. Menunggu frame kamera berikutnya.");
+        ? "Timer sesi tetap berjalan saat tab tidak aktif. Pembacaan EAR dilanjutkan saat browser memberi frame kamera baru."
+        : "Timer sesi tetap berjalan. Menunggu frame kamera berikutnya.");
+
     const snapshot = {
       success: true,
       phase: "MONITORING",
       message,
       is_calibrated: true,
       baseline_ear: this.engine.baselineEar || last.baseline_ear || 0,
-      ear_left: last.ear_left || this.engine.baselineEar || 0,
-      ear_right: last.ear_right || this.engine.baselineEar || 0,
-      ear_avg: last.ear_avg || this.engine.baselineEar || 0,
+      calibration_progress: 1,
       background_mode: true,
+      frame_stale_seconds: frameStaleSeconds,
+      close_reason: reason,
       save_interval_seconds: hidden ? 5 : 2,
       ...detectionPayload,
       ...fatigue,
@@ -542,7 +593,7 @@ export class BrowserEyeMonitor {
       ? Math.max(0, (nowMs - this.lastProcessedFrameAtMs) / 1000)
       : 0;
     if (this.isCalibrated && frameGapSeconds > this.config.frameGapResetSeconds) {
-      this.engine.timeOnlyUpdate(nowMs / 1000);
+      this.engine.clockOnlyUpdate(nowMs / 1000);
     }
     this.lastProcessedFrameAtMs = nowMs;
     this.lastVideoTime = video.currentTime;
