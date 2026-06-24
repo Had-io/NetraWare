@@ -59,7 +59,7 @@ OPEN_BROWSER=1
 Setelah virtual environment aktif, jalankan:
 
 ```powershell
-python app.py
+python app.py / py app.py
 ```
 
 Browser akan membuka:
