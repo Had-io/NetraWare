@@ -1,6 +1,6 @@
-import { appUrl, downloadFromApi, getJson, postJson, setReportAccessToken } from "./api.js?v=5.4.0";
-import { initTheme } from "./theme.js?v=5.4.0";
-import { BrowserEyeMonitor } from "./browser-eye-monitor.js?v=5.4.0";
+import { appUrl, downloadFromApi, getJson, postJson, setReportAccessToken } from "./api.js?v=5.4.1";
+import { initTheme } from "./theme.js?v=5.4.1";
+import { BrowserEyeMonitor } from "./browser-eye-monitor.js?v=5.4.1";
 
 const $ = (id) => document.getElementById(id);
 const METRIC_SYNC_INTERVAL_MS = 1000;
@@ -404,7 +404,7 @@ async function startCamera() {
     disable("endSessionButton", false);
     connection("Deteksi lokal aktif", "success");
     message("Kamera aktif. Video diproses langsung di browser dan tidak dikirim ke Railway.", "success");
-    runLocalDetectionLoop();
+    animationFrameId = requestAnimationFrame(runLocalDetectionLoop);
   } catch (error) {
     captureRunning = false;
     if (animationFrameId !== null) cancelAnimationFrame(animationFrameId);

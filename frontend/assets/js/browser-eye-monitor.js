@@ -423,6 +423,7 @@ export class BrowserEyeMonitor {
     this.engine = new LocalFatigueEngine(this.config);
     this.isCalibrated = false;
     this.lastVideoTime = -1;
+    this.lastMediaPipeTimestampMs = -1;
     this.lastResult = null;
   }
 
@@ -476,8 +477,18 @@ export class BrowserEyeMonitor {
     if (video.currentTime === this.lastVideoTime) return null;
     this.lastVideoTime = video.currentTime;
 
-    const result = this.faceLandmarker.detectForVideo(video, nowMs);
-    const nowSeconds = nowMs / 1000;
+    // MediaPipe VIDEO mode requires timestamps to be strictly monotonically
+    // increasing for the entire lifetime of this FaceLandmarker instance.
+    // requestAnimationFrame timestamps can occasionally be slightly older than
+    // a preceding performance.now() value, so guard the value explicitly.
+    const requestedTimestampMs = Number.isFinite(nowMs) ? nowMs : performance.now();
+    const mediaPipeTimestampMs = this.lastMediaPipeTimestampMs >= 0
+      ? Math.max(requestedTimestampMs, this.lastMediaPipeTimestampMs + 1)
+      : requestedTimestampMs;
+    this.lastMediaPipeTimestampMs = mediaPipeTimestampMs;
+
+    const result = this.faceLandmarker.detectForVideo(video, mediaPipeTimestampMs);
+    const nowSeconds = mediaPipeTimestampMs / 1000;
     const landmarks = result.faceLandmarks?.[0];
     if (!landmarks) return this.handleMissing(video, nowSeconds);
 

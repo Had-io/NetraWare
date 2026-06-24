@@ -17,7 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 FRONTEND_DIR = PROJECT_ROOT / "frontend"
 REPORT_DIR = PROJECT_ROOT / "data" / "reports"
 LOG_PATH = configure_logging(PROJECT_ROOT)
-APP_VERSION = "5.4.0"
+APP_VERSION = "5.4.1"
 REPORT_MAX_AGE_HOURS = 24
 REPORT_CLEANUP_INTERVAL_SECONDS = 3600
 
