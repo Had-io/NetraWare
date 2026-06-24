@@ -1,9 +1,13 @@
-import { appUrl, downloadFromApi, getJson, postJson, setReportAccessToken } from "./api.js?v=5.4.1";
-import { initTheme } from "./theme.js?v=5.4.1";
-import { BrowserEyeMonitor } from "./browser-eye-monitor.js?v=5.4.1";
+import { appUrl, downloadFromApi, getJson, postJson, setReportAccessToken } from "./api.js?v=5.4.2";
+import { initTheme } from "./theme.js?v=5.4.2";
+import { BrowserEyeMonitor } from "./browser-eye-monitor.js?v=5.4.2";
 
 const $ = (id) => document.getElementById(id);
 const METRIC_SYNC_INTERVAL_MS = 1000;
+const BACKGROUND_SYNC_INTERVAL_MS = 5000;
+const BACKGROUND_TICK_INTERVAL_MS = 1000;
+const FRAME_STALE_THRESHOLD_MS = 1800;
+const DESKTOP_NOTIFICATION_COOLDOWN_MS = 5 * 60 * 1000;
 
 let stream = null;
 let captureRunning = false;
@@ -22,6 +26,12 @@ let lastMetricLogAt = 0;
 let consecutiveFrameErrors = 0;
 let audioContext = null;
 let lastAudioAlertAt = 0;
+let backgroundTimerWorker = null;
+let fallbackTimerId = null;
+let lastVisualFrameProcessedAt = 0;
+let lastBackgroundMetricSyncAt = 0;
+let notificationPermissionAsked = false;
+let lastDesktopNotificationAt = 0;
 
 const AUDIO_ENABLED_KEY = "netraware-audio-enabled";
 const AUDIO_VOLUME_KEY = "netraware-audio-volume";
@@ -186,6 +196,78 @@ function initializeAudioSettings() {
   });
 }
 
+
+function requestDesktopNotificationPermission() {
+  if (!("Notification" in window) || notificationPermissionAsked) return;
+  notificationPermissionAsked = true;
+  if (Notification.permission === "default") {
+    Notification.requestPermission().catch(() => {});
+  }
+}
+
+function showDesktopNotification(data) {
+  if (!("Notification" in window)) return;
+  if (!document.hidden || Notification.permission !== "granted") return;
+  const now = Date.now();
+  if (now - lastDesktopNotificationAt < DESKTOP_NOTIFICATION_COOLDOWN_MS) return;
+  lastDesktopNotificationAt = now;
+  try {
+    new Notification("NetraWare: waktunya istirahat mata", {
+      body: data.message || "Alihkan pandangan dari layar dan istirahat sejenak.",
+      tag: "netraware-rest-reminder",
+      renotify: true,
+    });
+  } catch {
+    // Notifikasi desktop bersifat opsional; banner dashboard tetap aktif.
+  }
+}
+
+function startBackgroundTimer() {
+  stopBackgroundTimer();
+  try {
+    backgroundTimerWorker = new Worker("/assets/js/background-timer-worker.js?v=5.4.2");
+    backgroundTimerWorker.onmessage = () => handleBackgroundTick();
+    backgroundTimerWorker.postMessage({ type: "start", intervalMs: BACKGROUND_TICK_INTERVAL_MS });
+    return;
+  } catch {
+    backgroundTimerWorker = null;
+  }
+  fallbackTimerId = window.setInterval(handleBackgroundTick, BACKGROUND_TICK_INTERVAL_MS);
+}
+
+function stopBackgroundTimer() {
+  if (backgroundTimerWorker) {
+    backgroundTimerWorker.postMessage({ type: "stop" });
+    backgroundTimerWorker.terminate();
+    backgroundTimerWorker = null;
+  }
+  if (fallbackTimerId !== null) {
+    clearInterval(fallbackTimerId);
+    fallbackTimerId = null;
+  }
+}
+
+function handleBackgroundTick({ forceSync = false } = {}) {
+  if (!captureRunning || sessionEnded || !browserMonitor?.isCalibrated) return;
+  const nowMs = performance.now();
+  const frameIsStale = !lastVisualFrameProcessedAt
+    || nowMs - lastVisualFrameProcessedAt >= FRAME_STALE_THRESHOLD_MS;
+  if (!document.hidden && !frameIsStale && !forceSync) return;
+
+  const data = browserMonitor.createTimeOnlySnapshot(nowMs, { hidden: document.hidden });
+  if (!data) return;
+  lastLocalMetric = data;
+  updateDashboard(data);
+
+  const dueForSync = forceSync
+    || data.should_alert
+    || nowMs - lastBackgroundMetricSyncAt >= BACKGROUND_SYNC_INTERVAL_MS;
+  if (dueForSync) {
+    lastBackgroundMetricSyncAt = nowMs;
+    void syncMetricToBackend(data, nowMs, true).catch(() => {});
+  }
+}
+
 function formatNumber(value, digits = 2) {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric.toFixed(digits) : "0";
@@ -217,6 +299,8 @@ function statusLabel(status) {
 }
 
 function eyeStateLabel(data) {
+  if (data.background_mode || data.eye_state === "BACKGROUND") return "Timer background";
+  if (data.eye_state === "MENUNGGU_FRAME") return "Menunggu frame";
   if (data.blink_event) return "Kedip terdeteksi";
   if (data.eye_state === "TERTUTUP" || data.is_eye_closed) return "Tertutup";
   if (data.eye_state === "TERBUKA") return "Terbuka";
@@ -276,7 +360,7 @@ function updateDashboard(data) {
   }
 
   if (data.phase === "MONITORING") {
-    text("phaseLabel", data.success ? "Monitoring aktif." : "Monitoring aktif, tetapi wajah belum terbaca.");
+    text("phaseLabel", data.background_mode ? "Monitoring waktu aktif di background." : (data.success ? "Monitoring aktif." : "Monitoring aktif, tetapi wajah belum terbaca."));
     text("statusLabel", statusLabel(data.status));
     text("statusMessage", data.message || "-");
     updateMetrics(data);
@@ -284,14 +368,19 @@ function updateDashboard(data) {
     if (data.storage_ok === false) {
       connection("Monitoring aktif • penyimpanan bermasalah", "warning");
       message(data.storage_warning || "Monitoring berjalan, tetapi data metrik belum dapat disimpan.", "error");
+    } else if (data.background_mode) {
+      connection("Timer background aktif", "warning");
     } else {
       connection(data.success ? "Monitoring aktif" : "Wajah tidak terbaca", data.success ? "success" : "neutral");
     }
-    if (data.success) appendMetricLog(data);
+    if (data.success && !data.background_mode) appendMetricLog(data);
     const needsRest = data.status === "PERLU_ISTIRAHAT";
     show("alertBanner", needsRest);
     if (needsRest) text("alertMessage", data.message);
-    if (data.should_alert) void playAlertSound();
+    if (data.should_alert) {
+      void playAlertSound();
+      showDesktopNotification(data);
+    }
   }
 }
 
@@ -363,6 +452,7 @@ async function ensureBrowserMonitor() {
 async function startCamera() {
   if (sessionEnded || captureRunning) return;
   unlockAudio();
+  requestDesktopNotificationPermission();
   if (!navigator.mediaDevices?.getUserMedia) {
     return message("Browser tidak mendukung akses kamera. Gunakan Chrome, Edge, atau Safari terbaru.", "error");
   }
@@ -400,6 +490,9 @@ async function startCamera() {
     lastMetricSyncAt = 0;
     localFrameCount = 0;
     localFpsWindowStartedAt = performance.now();
+    lastVisualFrameProcessedAt = 0;
+    lastBackgroundMetricSyncAt = 0;
+    startBackgroundTimer();
     disable("stopCameraButton", false);
     disable("endSessionButton", false);
     connection("Deteksi lokal aktif", "success");
@@ -445,7 +538,7 @@ function buildMetricPayload(data) {
     fatigue_score: Number(data.fatigue_score) || 0,
     status: data.status || "NORMAL",
     should_alert: Boolean(data.should_alert),
-    save_interval_seconds: 1,
+    save_interval_seconds: Math.max(0.25, Number(data.save_interval_seconds) || 1),
   };
 }
 
@@ -484,10 +577,11 @@ function runLocalDetectionLoop(nowMs = performance.now()) {
   try {
     const data = browserMonitor.processVideoFrame(video, nowMs);
     if (data) {
+      lastVisualFrameProcessedAt = nowMs;
       lastLocalMetric = data;
       localFrameCount += 1;
       updateDashboard(data);
-      syncMetricToBackend(data, nowMs, data.phase === "CALIBRATION_DONE");
+      void syncMetricToBackend(data, nowMs, data.phase === "CALIBRATION_DONE").catch(() => {});
 
       if (nowMs - localFpsWindowStartedAt >= 2000) {
         const localFps = localFrameCount / ((nowMs - localFpsWindowStartedAt) / 1000);
@@ -516,9 +610,10 @@ function stopCamera({ silent = false, notifyBackend = true } = {}) {
   captureRunning = false;
   if (animationFrameId !== null) cancelAnimationFrame(animationFrameId);
   animationFrameId = null;
+  stopBackgroundTimer();
   browserMonitor?.pause();
   if (lastLocalMetric?.is_calibrated) {
-    syncMetricToBackend(lastLocalMetric, performance.now(), true);
+    void syncMetricToBackend(lastLocalMetric, performance.now(), true).catch(() => {});
   }
   stream?.getTracks().forEach((track) => track.stop());
   stream = null;
@@ -675,6 +770,17 @@ $("alertRestButton").addEventListener("click", markRest);
 $("endSessionButton").addEventListener("click", endSession);
 $("startAgainButton").addEventListener("click", startAgain);
 $("downloadPdfButton").addEventListener("click", downloadPdf);
+document.addEventListener("visibilitychange", () => {
+  if (!captureRunning || sessionEnded) return;
+  if (document.hidden) {
+    handleBackgroundTick({ forceSync: true });
+  } else {
+    handleBackgroundTick({ forceSync: true });
+    if (browserMonitor?.isCalibrated) {
+      message("Tab aktif kembali. Deteksi mata real-time dilanjutkan; timer tidak diulang dari nol.", "success");
+    }
+  }
+});
 window.addEventListener("beforeunload", () => {
   const code = sessionCode();
   if (captureRunning && code && !sessionEnded) {

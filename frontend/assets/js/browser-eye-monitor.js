@@ -24,6 +24,7 @@ const DEFAULT_CONFIG = Object.freeze({
   alertCooldownSeconds: 5,
   alertGracePeriodSeconds: 12,
   longEyeClosureSeconds: 2,
+  frameGapResetSeconds: 2.5,
 });
 
 function clamp(value, minimum, maximum) {
@@ -137,6 +138,25 @@ class LocalFatigueEngine {
     this.closedStartedAt = null;
     this.closedFrameCount = 0;
     this.currentEyeClosedSeconds = 0;
+  }
+
+  timeOnlyUpdate(nowSeconds) {
+    this.ensureStarted(nowSeconds);
+    this.resetClosure();
+    const lastSample = this.eyeStateWindow.length
+      ? this.eyeStateWindow[this.eyeStateWindow.length - 1][0]
+      : null;
+    if (lastSample === null || nowSeconds - lastSample >= 0.5) {
+      this.eyeStateWindow.push([nowSeconds, 0]);
+    }
+    this.prune(nowSeconds);
+    const ear = this.baselineEar || 0;
+    return this.buildResult({
+      ear,
+      isEyeClosed: false,
+      blinkEvent: false,
+      nowSeconds,
+    });
   }
 
   setBaseline(baselineEar) {
@@ -424,7 +444,9 @@ export class BrowserEyeMonitor {
     this.isCalibrated = false;
     this.lastVideoTime = -1;
     this.lastMediaPipeTimestampMs = -1;
+    this.lastProcessedFrameAtMs = -1;
     this.lastResult = null;
+    this.lastDetectionPayload = null;
   }
 
   async initialize() {
@@ -457,7 +479,10 @@ export class BrowserEyeMonitor {
     this.engine.reset();
     this.isCalibrated = false;
     this.lastVideoTime = -1;
+    this.lastMediaPipeTimestampMs = -1;
+    this.lastProcessedFrameAtMs = -1;
     this.lastResult = null;
+    this.lastDetectionPayload = null;
   }
 
   pause(nowMs = performance.now()) {
@@ -472,9 +497,54 @@ export class BrowserEyeMonitor {
     if (this.isCalibrated) this.engine.markRest(nowMs / 1000);
   }
 
+  createTimeOnlySnapshot(nowMs = performance.now(), { hidden = document.hidden } = {}) {
+    if (!this.isCalibrated) return null;
+    const nowSeconds = nowMs / 1000;
+    const fatigue = this.engine.timeOnlyUpdate(nowSeconds);
+    const last = this.lastResult || {};
+    const detectionPayload = this.lastDetectionPayload || {
+      image_width: last.image_width || 0,
+      image_height: last.image_height || 0,
+      left_eye_points: [],
+      right_eye_points: [],
+    };
+    const message = fatigue.status === "PERLU_ISTIRAHAT"
+      ? fatigue.message
+      : (hidden
+        ? "Timer layar tetap berjalan di background. Deteksi mata dilanjutkan otomatis saat tab aktif kembali."
+        : "Timer layar tetap berjalan. Menunggu frame kamera berikutnya.");
+    const snapshot = {
+      success: true,
+      phase: "MONITORING",
+      message,
+      is_calibrated: true,
+      baseline_ear: this.engine.baselineEar || last.baseline_ear || 0,
+      ear_left: last.ear_left || this.engine.baselineEar || 0,
+      ear_right: last.ear_right || this.engine.baselineEar || 0,
+      ear_avg: last.ear_avg || this.engine.baselineEar || 0,
+      background_mode: true,
+      save_interval_seconds: hidden ? 5 : 2,
+      ...detectionPayload,
+      ...fatigue,
+      is_eye_closed: false,
+      eye_state: hidden ? "BACKGROUND" : "MENUNGGU_FRAME",
+      current_eye_closed_seconds: 0,
+      message,
+    };
+    this.lastResult = snapshot;
+    return snapshot;
+  }
+
   processVideoFrame(video, nowMs = performance.now()) {
     if (!this.faceLandmarker || !video.videoWidth || !video.videoHeight) return null;
     if (video.currentTime === this.lastVideoTime) return null;
+    const frameGapSeconds = this.lastProcessedFrameAtMs >= 0
+      ? Math.max(0, (nowMs - this.lastProcessedFrameAtMs) / 1000)
+      : 0;
+    if (this.isCalibrated && frameGapSeconds > this.config.frameGapResetSeconds) {
+      this.engine.timeOnlyUpdate(nowMs / 1000);
+    }
+    this.lastProcessedFrameAtMs = nowMs;
     this.lastVideoTime = video.currentTime;
 
     // MediaPipe VIDEO mode requires timestamps to be strictly monotonically
@@ -511,6 +581,7 @@ export class BrowserEyeMonitor {
       ear_right: earRight,
       ear_avg: earAvg,
     };
+    this.lastDetectionPayload = detectionPayload;
 
     if (!this.isCalibrated) {
       this.calibration.add(earAvg, nowSeconds);
