@@ -1,5 +1,5 @@
-import { appUrl, postJson } from "./api.js?v=5.4.3";
-import { initTheme } from "./theme.js?v=5.4.3";
+import { appUrl, postJson } from "./api.js?v=5.5.0";
+import { initTheme } from "./theme.js?v=5.5.0";
 
 const $ = (id) => document.getElementById(id);
 

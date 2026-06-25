@@ -1,6 +1,6 @@
-import { appUrl, downloadFromApi, getJson, postJson, setReportAccessToken } from "./api.js?v=5.4.3";
-import { initTheme } from "./theme.js?v=5.4.3";
-import { BrowserEyeMonitor } from "./browser-eye-monitor.js?v=5.4.3";
+import { appUrl, downloadFromApi, getJson, postJson, setReportAccessToken } from "./api.js?v=5.5.0";
+import { initTheme } from "./theme.js?v=5.5.0";
+import { BrowserEyeMonitor } from "./browser-eye-monitor.js?v=5.5.0";
 
 const $ = (id) => document.getElementById(id);
 const METRIC_SYNC_INTERVAL_MS = 1000;
@@ -34,6 +34,10 @@ let lastBackgroundMetricSyncAt = 0;
 let notificationPermissionAsked = false;
 let lastDesktopNotificationAt = 0;
 let pageCloseSignalSent = false;
+let floatingMonitorWindow = null;
+let floatingMonitorMode = "none";
+let floatingMonitorStartedAt = 0;
+
 
 const AUDIO_ENABLED_KEY = "netraware-audio-enabled";
 const AUDIO_VOLUME_KEY = "netraware-audio-volume";
@@ -395,6 +399,238 @@ function appendMetricLog(data) {
   `).join("");
 }
 
+
+function isFloatingMonitorAlive() {
+  return Boolean(floatingMonitorWindow && !floatingMonitorWindow.closed);
+}
+
+function floatingModeLabel() {
+  if (floatingMonitorMode === "document-picture-in-picture") return "Picture-in-Picture";
+  if (floatingMonitorMode === "popup") return "popup monitor";
+  return "floating monitor";
+}
+
+function handleFloatingMonitorEvent(event) {
+  const type = event?.data?.type || event?.type;
+  const payload = event?.data?.payload || event?.payload || {};
+  if (!type) return;
+
+  if (type === "ready") {
+    connection("Floating monitor siap", "warning");
+    return;
+  }
+
+  if (type === "metric") {
+    lastLocalMetric = payload;
+    if (payload.phase !== "CALIBRATING") lastVisualFrameProcessedAt = performance.now();
+    updateDashboard(payload);
+    return;
+  }
+
+  if (type === "status") {
+    connection(payload.label || "Floating monitor aktif", payload.level || "success");
+    if (payload.message) message(payload.message, payload.messageType || "");
+    return;
+  }
+
+  if (type === "closed") {
+    captureRunning = false;
+    stopMonitoringSchedulers();
+    stream?.getTracks().forEach((track) => track.stop());
+    stream = null;
+    video.srcObject = null;
+    show("cameraPlaceholder", true);
+    disable("cameraButton", true);
+    disable("stopCameraButton", true);
+    disable("restButton", true);
+    disable("endSessionButton", true);
+    show("sessionFinishedCard", true);
+    sessionEnded = true;
+    connection("Sesi ditutup", "neutral");
+    text("statusLabel", "Sesi selesai");
+    text("statusMessage", payload.message || "Sesi ditutup karena floating monitor ditutup.");
+    message(payload.message || "Sesi ditutup karena floating monitor ditutup.", "success");
+    return;
+  }
+
+  if (type === "error") {
+    connection("Floating monitor bermasalah", "danger");
+    message(payload.message || "Floating monitor gagal berjalan.", "error");
+  }
+}
+
+function renderFloatingMonitorDocument(targetWindow, mode) {
+  const isPip = mode === "document-picture-in-picture";
+  targetWindow.__NETRAWARE_FLOATING_CONFIG__ = {
+    sessionCode: sessionCode(),
+    userCode: userCode(),
+    appOrigin: location.origin,
+    version: "5.5.0",
+    mode,
+  };
+  targetWindow.__NETRAWARE_PARENT_BRIDGE__ = handleFloatingMonitorEvent;
+
+  const doc = targetWindow.document;
+  doc.open();
+  doc.write(`<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <base href="${location.origin}/">
+  <title>NetraWare Floating Monitor</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: radial-gradient(circle at 25% 0%, #155e75 0, #0f172a 42%, #020617 100%);
+      color: #e5f4ff;
+      min-width: 320px;
+      overflow: hidden;
+    }
+    .shell { min-height: 100vh; display: flex; flex-direction: column; gap: 10px; padding: 12px; }
+    .top { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+    .brand { display:flex; flex-direction:column; gap:1px; line-height:1.05; }
+    .brand strong { font-size: 15px; letter-spacing: .01em; }
+    .brand span { font-size: 11px; color:#93c5fd; text-transform: uppercase; letter-spacing:.12em; }
+    .chip { border:1px solid rgba(148,163,184,.24); background:rgba(15,23,42,.68); color:#bbf7d0; border-radius:999px; padding:6px 9px; font-size:11px; white-space:nowrap; }
+    .video-wrap { position:relative; width:100%; aspect-ratio:4/3; border-radius:18px; overflow:hidden; background:#020617; border:1px solid rgba(125,211,252,.25); box-shadow:0 20px 48px rgba(0,0,0,.34); }
+    video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; transform:scaleX(-1); }
+    canvas { pointer-events:none; }
+    .placeholder { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; flex-direction:column; text-align:center; padding:18px; background:linear-gradient(145deg, rgba(15,23,42,.88), rgba(8,47,73,.82)); }
+    .placeholder strong { font-size:16px; }
+    .placeholder small { margin-top:6px; color:#bfdbfe; line-height:1.35; }
+    .status-card { background:rgba(15,23,42,.72); border:1px solid rgba(148,163,184,.22); border-radius:16px; padding:11px; box-shadow:0 14px 34px rgba(0,0,0,.22); }
+    .status-card small { color:#93c5fd; text-transform:uppercase; letter-spacing:.12em; font-size:10px; }
+    .status-card h1 { margin:5px 0 4px; font-size:20px; }
+    .status-card p { margin:0; color:#dbeafe; font-size:12px; line-height:1.35; }
+    .metrics { display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:8px; }
+    .metric { background:rgba(2,6,23,.54); border:1px solid rgba(148,163,184,.18); border-radius:14px; padding:9px; }
+    .metric span { display:block; color:#93c5fd; font-size:10px; text-transform:uppercase; letter-spacing:.08em; }
+    .metric strong { display:block; margin-top:3px; font-size:18px; }
+    .actions { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    button { border:0; border-radius:12px; padding:10px 12px; font-weight:700; cursor:pointer; color:#ecfeff; background:linear-gradient(135deg,#0f766e,#0ea5e9); box-shadow:0 10px 20px rgba(8,145,178,.2); }
+    button.secondary { background:rgba(15,23,42,.8); border:1px solid rgba(148,163,184,.28); box-shadow:none; }
+    button.danger { background:linear-gradient(135deg,#dc2626,#f97316); }
+    .foot { color:#bae6fd; font-size:10px; line-height:1.35; text-align:center; opacity:.9; }
+    .hidden { display:none !important; }
+    @media (max-height: 560px) { .metric strong { font-size:16px; } .status-card h1{font-size:18px;} .shell{gap:8px;padding:10px;} }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="top">
+      <div class="brand"><span>NetraWare</span><strong>Floating Monitor</strong></div>
+      <div id="modeChip" class="chip">${isPip ? "PiP aktif" : "Popup aktif"}</div>
+    </section>
+    <section class="video-wrap">
+      <video id="floatingVideo" autoplay muted playsinline></video>
+      <canvas id="floatingOverlay"></canvas>
+      <div id="floatingPlaceholder" class="placeholder"><strong>Menyiapkan kamera…</strong><small>Jaga jendela kecil ini tetap terbuka saat bekerja di Word/aplikasi lain.</small></div>
+    </section>
+    <section id="floatingStatusCard" class="status-card">
+      <small>Status saat ini</small>
+      <h1 id="floatingStatusLabel">Menyiapkan</h1>
+      <p id="floatingStatusMessage">Memuat MediaPipe dan menunggu izin kamera.</p>
+    </section>
+    <section class="metrics">
+      <div class="metric"><span>EAR</span><strong id="floatingEar">0.000</strong></div>
+      <div class="metric"><span>Kedip</span><strong id="floatingBlink">0</strong></div>
+      <div class="metric"><span>Skor</span><strong id="floatingScore">0.0</strong></div>
+      <div class="metric"><span>Durasi</span><strong id="floatingDuration">00:00</strong></div>
+    </section>
+    <section class="actions">
+      <button id="floatingRestButton" type="button" class="secondary">Tandai istirahat</button>
+      <button id="floatingEndButton" type="button" class="danger">Akhiri sesi</button>
+    </section>
+    <div class="foot">Deteksi berjalan dari floating window, bukan dari tab dashboard yang tersembunyi.</div>
+  </main>
+  <script type="module" src="/assets/js/floating-monitor.js?v=5.5.0"></script>
+</body>
+</html>`);
+  doc.close();
+  targetWindow.__NETRAWARE_FLOATING_CONFIG__ = {
+    sessionCode: sessionCode(),
+    userCode: userCode(),
+    appOrigin: location.origin,
+    version: "5.5.0",
+    mode,
+  };
+  targetWindow.__NETRAWARE_PARENT_BRIDGE__ = handleFloatingMonitorEvent;
+}
+
+
+async function openFloatingMonitorWindow() {
+  if (isFloatingMonitorAlive()) {
+    focusFloatingMonitor();
+    return floatingMonitorWindow;
+  }
+
+  if ("documentPictureInPicture" in window) {
+    floatingMonitorMode = "document-picture-in-picture";
+    floatingMonitorWindow = await window.documentPictureInPicture.requestWindow({ width: 380, height: 620 });
+    renderFloatingMonitorDocument(floatingMonitorWindow, floatingMonitorMode);
+    return floatingMonitorWindow;
+  }
+
+  floatingMonitorMode = "popup";
+  floatingMonitorWindow = window.open(
+    "",
+    "netraware-floating-monitor",
+    "popup=yes,width=380,height=620,left=80,top=80,resizable=yes,scrollbars=no",
+  );
+  if (!floatingMonitorWindow) {
+    floatingMonitorMode = "none";
+    throw new Error("Popup floating monitor diblokir browser. Izinkan popup untuk netraware.my.id atau gunakan Chrome/Edge terbaru.");
+  }
+  renderFloatingMonitorDocument(floatingMonitorWindow, floatingMonitorMode);
+  return floatingMonitorWindow;
+}
+
+function focusFloatingMonitor() {
+  if (!isFloatingMonitorAlive()) {
+    message("Floating monitor belum aktif. Tekan Mulai floating monitor.", "error");
+    return;
+  }
+  try { floatingMonitorWindow.focus(); } catch {}
+  message(`Floating monitor ${floatingModeLabel()} sudah aktif. Biarkan jendela kecil itu terbuka saat bekerja.`, "success");
+}
+
+function deliverStreamToFloatingMonitor() {
+  if (!stream || !isFloatingMonitorAlive()) return;
+  try {
+    floatingMonitorWindow.__NETRAWARE_STREAM__ = stream;
+    floatingMonitorWindow.dispatchEvent(new floatingMonitorWindow.CustomEvent("netraware-stream-ready"));
+  } catch (error) {
+    message(`Stream kamera gagal dikirim ke floating monitor: ${error.message}`, "error");
+  }
+}
+
+function sendFloatingCommand(command) {
+  if (!isFloatingMonitorAlive()) return false;
+  try {
+    if (typeof floatingMonitorWindow.__NETRAWARE_FLOATING_COMMAND__ === "function") {
+      floatingMonitorWindow.__NETRAWARE_FLOATING_COMMAND__(command);
+      return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+function disposeFloatingMonitor({ suppressCloseBeacon = true } = {}) {
+  if (!isFloatingMonitorAlive()) return;
+  try {
+    sendFloatingCommand({ type: "dispose", suppressCloseBeacon });
+    floatingMonitorWindow.close();
+  } catch {}
+  floatingMonitorWindow = null;
+  floatingMonitorMode = "none";
+}
+
 async function ensureBrowserMonitor() {
   if (!browserMonitor) {
     browserMonitor = new BrowserEyeMonitor({
@@ -411,21 +647,27 @@ async function startCamera() {
   unlockAudio();
   requestDesktopNotificationPermission();
   if (!navigator.mediaDevices?.getUserMedia) {
-    return message("Browser tidak mendukung akses kamera. Gunakan Chrome, Edge, atau Safari terbaru.", "error");
+    return message("Browser tidak mendukung akses kamera. Gunakan Chrome atau Microsoft Edge terbaru di komputer/laptop.", "error");
   }
   if (!window.isSecureContext && !["localhost", "127.0.0.1"].includes(location.hostname)) {
     return message("Kamera membutuhkan HTTPS atau localhost.", "error");
   }
 
   disable("cameraButton", true);
-  message("Memuat model MediaPipe di browser…");
-  text("eyeStateValue", "Memuat model…");
-  connection("Menyiapkan MediaPipe", "warning");
+  disable("stopCameraButton", true);
+  message("Membuka floating monitor…");
+  text("eyeStateValue", "Menyiapkan monitor…");
+  connection("Membuka floating monitor", "warning");
 
   try {
-    const monitor = await ensureBrowserMonitor();
-    if (!localSessionInitialized) monitor.reset();
+    await openFloatingMonitorWindow();
+  } catch (error) {
+    disable("cameraButton", false);
+    connection("Floating monitor gagal", "danger");
+    return message(error.message || "Floating monitor gagal dibuka.", "error");
+  }
 
+  try {
     stream = await navigator.mediaDevices.getUserMedia({
       video: {
         width: { ideal: 640 },
@@ -435,36 +677,40 @@ async function startCamera() {
       },
       audio: false,
     });
-    video.srcObject = stream;
-    await video.play();
-    await postJson(`/monitoring/resume/${encodeURIComponent(sessionCode())}`);
-    if (localSessionInitialized) monitor.resume();
-    localSessionInitialized = true;
 
-    show("cameraPlaceholder", false);
+    video.srcObject = stream;
+    await video.play().catch(() => {});
+    await postJson(`/monitoring/resume/${encodeURIComponent(sessionCode())}`).catch(() => {});
+
     captureRunning = true;
+    localSessionInitialized = true;
     metricSyncInFlight = false;
     lastMetricSyncAt = 0;
+    lastLocalMetric = null;
     localFrameCount = 0;
     localFpsWindowStartedAt = performance.now();
     lastVisualFrameProcessedAt = 0;
     lastBackgroundMetricSyncAt = 0;
+    floatingMonitorStartedAt = Date.now();
+
+    show("cameraPlaceholder", false);
     disable("stopCameraButton", false);
     disable("endSessionButton", false);
-    connection("Deteksi lokal aktif", "success");
-    message("Kamera aktif. Timer sesi hanya berhenti jika sesi diakhiri atau tab ditutup.", "success");
-    startMonitoringSchedulers();
+    connection("Floating monitor aktif", "success");
+    message(`Floating monitor ${floatingModeLabel()} aktif. Deteksi mata sekarang berjalan di jendela kecil, sehingga tetap bekerja saat membuka Word/aplikasi lain.`, "success");
+    deliverStreamToFloatingMonitor();
   } catch (error) {
     captureRunning = false;
     stopMonitoringSchedulers();
+    disposeFloatingMonitor({ suppressCloseBeacon: true });
     stream?.getTracks().forEach((track) => track.stop());
     stream = null;
     video.srcObject = null;
     show("cameraPlaceholder", true);
     disable("cameraButton", false);
     disable("stopCameraButton", true);
-    connection("MediaPipe gagal", "danger");
-    message(error.message || "Model MediaPipe atau kamera gagal diaktifkan.", "error");
+    connection("Kamera gagal", "danger");
+    message(error.message || "Kamera gagal diaktifkan.", "error");
   }
 }
 
@@ -626,6 +872,7 @@ function stopCamera({ silent = false, notifyBackend = true } = {}) {
   captureRunning = false;
   stopMonitoringSchedulers();
   browserMonitor?.pause();
+  disposeFloatingMonitor({ suppressCloseBeacon: true });
   if (lastLocalMetric?.is_calibrated) {
     syncMetricToBackend(lastLocalMetric, performance.now(), true);
   }
@@ -640,8 +887,8 @@ function stopCamera({ silent = false, notifyBackend = true } = {}) {
     notifyBackendPause(silent);
   }
   if (!silent) {
-    connection("Kamera berhenti", "neutral");
-    message("Kamera dihentikan. Deteksi lokal dijeda.");
+    connection("Floating monitor berhenti", "neutral");
+    message("Floating monitor dihentikan. Deteksi lokal dijeda.");
   }
 }
 
@@ -649,6 +896,7 @@ async function markRest() {
   try {
     await postJson(`/monitoring/rest/${encodeURIComponent(sessionCode())}`, { note: "Dicatat melalui dashboard." });
     browserMonitor?.markRest();
+    sendFloatingCommand({ type: "markRest" });
     show("alertBanner", false);
     text("restDurationValue", "00:00");
     message("Istirahat dicatat. Evidence temporal sebelumnya telah direset.", "success");
@@ -752,9 +1000,9 @@ async function loadSession() {
     const data = await getJson(`/monitoring/session/${encodeURIComponent(sessionCode())}`);
     if (data.session.final_status === "BERJALAN" && data.is_active) {
       text("statusLabel", "Siap dimulai");
-      text("statusMessage", "Aktifkan kamera untuk memulai kalibrasi.");
-      text("eyeStateValue", "Menunggu kamera");
-      connection("Kamera nonaktif", "neutral");
+      text("statusMessage", "Aktifkan floating monitor untuk memulai kalibrasi.");
+      text("eyeStateValue", "Menunggu floating monitor");
+      connection("Floating monitor nonaktif", "neutral");
       return;
     }
     sessionEnded = true;
@@ -791,12 +1039,14 @@ function sendCloseSessionBeacon() {
         type: "application/json",
       });
       navigator.sendBeacon(appUrl(`/api/monitoring/session/close/${encodeURIComponent(code)}`), body);
+      disposeFloatingMonitor({ suppressCloseBeacon: true });
       return;
     } catch {
       // Fallback di bawah tetap mencoba menutup sesi tanpa snapshot akhir.
     }
   }
   navigator.sendBeacon(appUrl(`/api/monitoring/session/close/${encodeURIComponent(code)}`));
+  disposeFloatingMonitor({ suppressCloseBeacon: true });
 }
 
 function bindNavigation() {
@@ -808,11 +1058,12 @@ function bindNavigation() {
   });
 }
 
+window.addEventListener("message", handleFloatingMonitorEvent);
 initTheme();
 initializeAudioSettings();
 bindNavigation();
 $("cameraButton").addEventListener("click", startCamera);
-$("stopCameraButton").addEventListener("click", () => stopCamera());
+$("stopCameraButton").addEventListener("click", focusFloatingMonitor);
 $("restButton").addEventListener("click", markRest);
 $("alertRestButton").addEventListener("click", markRest);
 $("endSessionButton").addEventListener("click", endSession);

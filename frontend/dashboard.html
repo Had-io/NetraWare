@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0f766e">
   <title>Dashboard | NetraWare</title>
   <script>try{const t=localStorage.getItem('netraware-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark')}catch(e){}</script>
-  <link rel="stylesheet" href="/assets/css/styles.css?v=5.4.3">
+  <link rel="stylesheet" href="/assets/css/styles.css?v=5.5.0">
 </head>
 <body class="app-body">
   <aside class="side-nav" aria-label="Navigasi dashboard">
@@ -67,17 +67,17 @@
 
       <section class="dashboard-grid">
         <article id="camera" class="panel camera-panel">
-          <div class="panel-header"><div><span class="eyebrow">Live camera</span><h2>Kamera monitoring</h2><p id="phaseLabel">Aktifkan kamera untuk memulai kalibrasi.</p></div></div>
+          <div class="panel-header"><div><span class="eyebrow">Live camera</span><h2>Kamera monitoring</h2><p id="phaseLabel">Aktifkan floating monitor untuk memulai kalibrasi.</p></div></div>
           <div class="video-frame">
             <video id="videoElement" autoplay muted playsinline></video>
             <canvas id="eyeOverlayCanvas"></canvas>
             <canvas id="captureCanvas" class="hidden"></canvas>
-            <div id="cameraPlaceholder" class="camera-placeholder"><span class="camera-glyph">◎</span><strong>Kamera belum aktif</strong><small>Tekan “Mulai kamera” dan berikan izin akses.</small></div>
+            <div id="cameraPlaceholder" class="camera-placeholder"><span class="camera-glyph">◎</span><strong>Floating monitor belum aktif</strong><small>Tekan “Mulai floating monitor”. Jendela kecil akan tetap berjalan saat membuka Word/aplikasi lain.</small></div>
           </div>
           <div class="calibration-row"><div><span>Kalibrasi personal</span><strong id="calibrationPercent">0%</strong></div><div class="progress-track"><span id="calibrationProgress"></span></div></div>
           <div class="action-row">
-            <button id="cameraButton" class="button primary" type="button">Mulai kamera</button>
-            <button id="stopCameraButton" class="button secondary" type="button" disabled>Hentikan</button>
+            <button id="cameraButton" class="button primary" type="button">Mulai floating monitor</button>
+            <button id="stopCameraButton" class="button secondary" type="button" disabled>Tampilkan monitor</button>
             <button id="restButton" class="button secondary" type="button">Tandai istirahat</button>
             <button id="endSessionButton" class="button danger" type="button">Akhiri sesi</button>
           </div>
@@ -114,6 +114,6 @@
   <nav class="mobile-nav" aria-label="Navigasi seluler">
     <a href="#overview">Ringkasan</a><a href="#camera">Kamera</a><a href="#logs">Log data</a><a href="#reports">Laporan</a>
   </nav>
-  <script type="module" src="/assets/js/dashboard.js?v=5.4.3"></script>
+  <script type="module" src="/assets/js/dashboard.js?v=5.5.0"></script>
 </body>
 </html>
